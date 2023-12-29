@@ -6,6 +6,7 @@ import (
 	"io/ioutil"
 	"net/url"
 	"os"
+	path1 "path"
 	"path/filepath"
 	"strings"
 
@@ -127,7 +128,8 @@ func IsAllowed(c *gin.Context, allowsMap map[string]bool) bool {
 func (http HTTP) Routes(router *gin.Engine, path string, allows ...string) {
 	var group gin.IRoutes = router
 	if http.Group != "" {
-		path = filepath.Join(path, "/", http.Group)
+		// path = filepath.Join(path, "/", http.Group)
+		path = path1.Join(path, "/", http.Group)
 	}
 	group = router.Group(path)
 	for _, path := range http.Paths {
