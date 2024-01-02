@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -99,6 +102,56 @@ func (path Path) processHandler(getArgs func(c *gin.Context) []interface{}) func
 		}
 	}
 	return handler
+}
+
+func (path Path) proxyHandler(getArgs func(c *gin.Context) []interface{}) func(c *gin.Context) {
+
+	var handler func(c *gin.Context)
+	remote, err := url.Parse(path.Proxy)
+	if err != nil {
+		ex := exception.Err(err, 500)
+		handler = func(c *gin.Context) {
+			c.JSON(ex.Code, gin.H{"message": ex.Message, "code": ex.Code})
+			c.Done()
+		}
+		return handler
+	}
+
+	var proxyPath string
+	// 获取*后的path名
+	names := strings.Split(path.Path, "/")
+	for _, name := range names {
+		if strings.HasPrefix(name, "*") {
+			proxyPath = name[1:]
+		}
+	}
+	if proxyPath == "" {
+		err := fmt.Errorf("invalid proxy path")
+		ex := exception.Err(err, 500)
+		handler = func(c *gin.Context) {
+			c.JSON(ex.Code, gin.H{"message": ex.Message, "code": ex.Code})
+			c.Done()
+		}
+		return handler
+	}
+
+	handler = func(c *gin.Context) {
+		proxy := httputil.NewSingleHostReverseProxy(remote)
+		//Define the director func
+		//This is a good place to log, for example
+		proxy.Director = func(req *http.Request) {
+			req.Header = c.Request.Header
+			req.Host = remote.Host
+			req.URL.Scheme = remote.Scheme
+			req.URL.Host = remote.Host
+			req.URL.Path = c.Param(proxyPath)
+		}
+		// 启动代理服务器
+		proxy.ServeHTTP(c.Writer, c.Request)
+		c.Done()
+	}
+	return handler
+
 }
 
 // redirectHandler default handler

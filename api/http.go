@@ -188,6 +188,8 @@ func (http HTTP) Route(router gin.IRoutes, path Path, allows ...string) {
 	} else if strings.HasPrefix(path.Out.Type, "text/event-stream") {
 		handlers = append(handlers, path.streamHandler(getArgs))
 
+	} else if path.Proxy != "" {
+		handlers = append(handlers, path.proxyHandler(getArgs))
 	} else {
 		handlers = append(handlers, path.defaultHandler(getArgs))
 	}

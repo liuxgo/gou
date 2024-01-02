@@ -33,6 +33,7 @@ type Path struct {
 	In             []interface{} `json:"in,omitempty"`
 	Out            Out           `json:"out,omitempty"`
 	ProcessHandler bool          `json:"processHandler,omitempty"`
+	Proxy          string        `json:"proxy,omitempty"`
 }
 
 // Out http 输出
