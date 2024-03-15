@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/evanw/esbuild/pkg/api"
+	"github.com/fatih/color"
 	"github.com/yaoapp/gou/application"
 	"github.com/yaoapp/gou/process"
 	"github.com/yaoapp/gou/runtime/v8/bridge"
@@ -22,7 +23,7 @@ var Scripts = map[string]*Script{}
 // RootScripts the scripts for studio
 var RootScripts = map[string]*Script{}
 
-var importRe = regexp.MustCompile(`import\s+.*;`)
+var importRe = regexp.MustCompile(`import\s*\t*\n*[^;]*;`)
 
 // NewScript create a new script
 func NewScript(file string, id string, timeout ...time.Duration) *Script {
@@ -86,6 +87,10 @@ func TransformTS(source []byte) ([]byte, error) {
 
 	// @todo import supoort
 	jsCode := importRe.ReplaceAllString(string(source), "")
+	if strings.Contains(jsCode, "import") {
+		fmt.Println(jsCode)
+	}
+
 	result := api.Transform(jsCode, api.TransformOptions{
 		Loader: api.LoaderTS,
 		Target: api.ESNext,
@@ -139,8 +144,6 @@ func SelectRoot(id string) (*Script, error) {
 
 // NewContext create a new context
 func (script *Script) NewContext(sid string, global map[string]interface{}) (*Context, error) {
-
-	fmt.Println("create a new context", sid, script.ID)
 
 	timeout := script.Timeout
 	if timeout == 0 {
@@ -301,6 +304,12 @@ func (script *Script) execStandard(process *process.Process) interface{} {
 
 	jsRes, err := global.MethodCall(process.Method, bridge.Valuers(jsArgs)...)
 	if err != nil {
+
+		// Debug output the error stack
+		if e, ok := err.(*v8go.JSError); ok {
+			color.Red("%s\n\n", e.StackTrace)
+		}
+
 		log.Error("scripts.%s.%s %s", script.ID, process.Method, err.Error())
 		exception.Err(err, 500).Throw()
 		return nil
