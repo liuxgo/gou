@@ -2,11 +2,14 @@ package v8
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/evanw/esbuild/pkg/api"
+	"github.com/fatih/color"
 	"github.com/yaoapp/gou/application"
 	"github.com/yaoapp/gou/process"
 	"github.com/yaoapp/gou/runtime/v8/bridge"
@@ -19,10 +22,26 @@ import (
 // Scripts loaded scripts
 var Scripts = map[string]*Script{}
 
+// Modules the scripts for modules
+var Modules = map[string]Module{}
+
+// ModuleSourceMap the module source maps
+var ModuleSourceMap = map[string]string{}
+
+// ImportMap the import maps
+var ImportMap = map[string][]Import{}
+
+// SourceMap the source maps
+var SourceMap = map[string]string{}
+
 // RootScripts the scripts for studio
 var RootScripts = map[string]*Script{}
 
-var importRe = regexp.MustCompile(`import\s+.*;`)
+// var importRe = regexp.MustCompile(`import\s*\t*\n*[^;]*;`)
+var importRe = regexp.MustCompile(`import\s+\t*\n*(\*\s+as\s+\w+|\{[^}]+\}|\w+)\s+from\s+["']([^"']+)["'];?`)
+var exportRe = regexp.MustCompile(`export\s+(default|function|class|const|var|let)\s+`)
+
+var internalKeepModules = []string{"/yao.ts", "/yao", "/gou", "/gou.ts"}
 
 // NewScript create a new script
 func NewScript(file string, id string, timeout ...time.Duration) *Script {
@@ -48,7 +67,7 @@ func Load(file string, id string) (*Script, error) {
 	}
 
 	if strings.HasSuffix(file, ".ts") {
-		source, err = TransformTS(source)
+		source, err = TransformTS(file, source)
 		if err != nil {
 			return nil, err
 		}
@@ -69,7 +88,7 @@ func LoadRoot(file string, id string) (*Script, error) {
 	}
 
 	if strings.HasSuffix(file, ".ts") {
-		source, err = TransformTS(source)
+		source, err = TransformTS(file, source)
 		if err != nil {
 			return nil, err
 		}
@@ -81,14 +100,26 @@ func LoadRoot(file string, id string) (*Script, error) {
 	return script, nil
 }
 
-// TransformTS transform the typescript
-func TransformTS(source []byte) ([]byte, error) {
+// CLearModules clear the modules cache
+func CLearModules() {
+	Modules = map[string]Module{}
+	ModuleSourceMap = map[string]string{}
+	ImportMap = map[string][]Import{}
+	SourceMap = map[string]string{}
+}
 
-	// @todo import supoort
-	jsCode := importRe.ReplaceAllString(string(source), "")
-	result := api.Transform(jsCode, api.TransformOptions{
-		Loader: api.LoaderTS,
-		Target: api.ESNext,
+// TransformTS transform the typescript
+func TransformTS(file string, source []byte) ([]byte, error) {
+
+	tsCode, err := tsImports(file, source)
+	if err != nil {
+		return nil, err
+	}
+
+	result := api.Transform(tsCode, api.TransformOptions{
+		Loader:    api.LoaderTS,
+		Target:    api.ESNext,
+		Sourcemap: api.SourceMapExternal,
 	})
 
 	if len(result.Errors) > 0 {
@@ -99,7 +130,255 @@ func TransformTS(source []byte) ([]byte, error) {
 		return nil, fmt.Errorf("transform ts code error: %v", strings.Join(errors, "\n"))
 	}
 
-	return result.Code, nil
+	// Add the source map
+	SourceMap[file] = string(result.Map)
+
+	// Add the module source
+	jsCode := result.Code
+
+	// Add the import module
+	if runtimeOption.Import {
+		importCodes := []string{}
+		if imports, has := ImportMap[file]; has {
+			for _, imp := range imports {
+				module, has := Modules[imp.AbsPath]
+				if has {
+					importCodes = append(importCodes, fmt.Sprintf("%s;\nconst %s = %s;", module.Source, imp.Name, module.GlobalName))
+				}
+			}
+		}
+
+		if len(importCodes) > 0 {
+			jsCode = []byte(strings.Join(importCodes, "\n") + "\n" + string(result.Code))
+		}
+	}
+
+	return []byte(
+		exportRe.ReplaceAllStringFunc(string(jsCode), func(m string) string {
+			return strings.ReplaceAll(m, "export ", "")
+		})), nil
+}
+
+type entry struct {
+	absfile string
+	source  string
+	file    string
+}
+
+func getEntryPoints(file string, tsCode string, loaded map[string]bool) (string, []entry, error) {
+	entryPoints := []entry{}
+	root := application.App.Root()
+	absFile := filepath.Join(root, file)
+
+	tsCode, imports, err := replaceImportCode(file, []byte(tsCode))
+	if err != nil {
+		return "", nil, err
+	}
+	ImportMap[file] = imports
+	entryPoints = append(entryPoints, entry{file: file, absfile: absFile, source: tsCode})
+
+	for _, imp := range imports {
+		if loaded[imp.Path] {
+			continue
+		}
+		loaded[imp.Path] = true
+		source, err := application.App.Read(imp.Path)
+		if err != nil {
+			return "", nil, err
+		}
+
+		_, subEntryPoints, err := getEntryPoints(imp.Path, string(source), loaded)
+		if err != nil {
+			return "", nil, err
+		}
+
+		entryPoints = append(entryPoints, subEntryPoints...)
+	}
+	return tsCode, entryPoints, nil
+
+}
+
+func loadModule(file string, tsCode string) error {
+
+	errors := []string{}
+	root := application.App.Root()
+	absFile := filepath.Join(root, file)
+
+	// Check if the module loaded
+	if _, has := Modules[absFile]; has {
+		return nil
+	}
+
+	globalName := strings.ReplaceAll(strings.ReplaceAll(file, "/", "_"), ".", "_")
+	entryPoints := []entry{}
+	loaded := map[string]bool{}
+	tsCode, entryPoints, err := getEntryPoints(file, tsCode, loaded)
+	if err != nil {
+		return err
+	}
+
+	files := []string{}
+	codes := map[string]string{}
+	for _, entry := range entryPoints {
+		files = append(files, entry.absfile)
+		codes[entry.absfile] = entry.source
+	}
+
+	dir := filepath.Dir(absFile)
+	outdir := filepath.Join(string(os.PathSeparator), "outdir")
+
+	result := api.Build(api.BuildOptions{
+		EntryPoints: files,
+		Bundle:      true,
+		Write:       false,
+		Target:      api.ESNext,
+		GlobalName:  globalName,
+		Loader: map[string]api.Loader{
+			".ts": api.LoaderTS,
+		},
+		Sourcemap: api.SourceMapExternal,
+		Outdir:    outdir,
+		Plugins: []api.Plugin{
+			{
+				Name: "custom-import-plugin",
+				Setup: func(build api.PluginBuild) {
+					build.OnLoad(api.OnLoadOptions{Filter: `.*\.ts$`}, func(args api.OnLoadArgs) (api.OnLoadResult, error) {
+						contents := codes[args.Path]
+						return api.OnLoadResult{
+							Contents: &contents,
+							Loader:   api.LoaderTS,
+						}, nil
+					})
+				},
+			},
+		},
+	})
+
+	if len(result.Errors) > 0 {
+		for _, err := range result.Errors {
+			errors = append(errors, err.Text)
+		}
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("transform module error: %v.\n%s", strings.Join(errors, "\n"), tsCode)
+	}
+
+	if len(result.OutputFiles) > 1 {
+		for _, out := range result.OutputFiles {
+			if strings.HasSuffix(out.Path, ".js.map") {
+				key := strings.TrimPrefix(strings.ReplaceAll(out.Path, ".js.map", ".ts.map"), outdir)
+				key = filepath.Join(dir, key)
+				ModuleSourceMap[key] = string(out.Contents)
+			} else if strings.HasSuffix(out.Path, ".js") {
+				key := strings.TrimPrefix(strings.ReplaceAll(out.Path, ".js", ".ts"), outdir)
+				key = filepath.Join(dir, key)
+				Modules[key] = Module{
+					File:       file,
+					GlobalName: globalName,
+					Source:     string(out.Contents),
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func tsImports(file string, source []byte) (string, error) {
+
+	err := loadModule(file, string(source))
+	if err != nil {
+		return "", err
+	}
+
+	tsCode := importRe.ReplaceAllStringFunc(string(source), func(m string) string { // Remove the import as comments
+		lines := strings.Split(m, "\n")
+		for i, line := range lines {
+			lines[i] = "// " + line
+		}
+		return strings.Join(lines, "\n")
+	})
+
+	return tsCode, nil
+}
+
+func replaceImportCode(file string, source []byte) (string, []Import, error) {
+	var err error = nil
+	errors := []string{}
+	imports := []Import{}
+	tsCode := importRe.ReplaceAllStringFunc(string(source), func(m string) string {
+		matches := importRe.FindStringSubmatch(m)
+		if len(matches) == 3 {
+			importClause, importPath := matches[1], matches[2]
+
+			// Filter the internal keep modules
+			for _, keep := range internalKeepModules {
+				if strings.HasSuffix(importPath, keep) {
+					lines := strings.Split(m, "\n")
+					for i, line := range lines {
+						lines[i] = "// " + line
+
+					}
+					return strings.Join(lines, "\n")
+				}
+			}
+
+			relImportPath, err := getImportPath(file, importPath)
+			if err != nil {
+				errors = append(errors, err.Error())
+				return m
+			}
+
+			absImportPath := filepath.Join(application.App.Root(), relImportPath)
+
+			name := strings.TrimSpace(importClause)
+			if strings.Index(importClause, "*") >= 0 {
+				arr := strings.Split(importClause, " as ")
+				if len(arr) == 2 {
+					name = strings.TrimSpace(arr[1])
+				}
+			} else if strings.Index(importClause, " as ") >= 0 {
+				name = strings.ReplaceAll(importClause, " as ", ":")
+			}
+
+			imports = append(imports, Import{
+				Name:    name,
+				Path:    relImportPath,
+				AbsPath: absImportPath,
+				Clause:  importClause,
+			})
+			return fmt.Sprintf(`import %s from "%s";`, importClause, absImportPath)
+		}
+		return m
+	})
+
+	if len(errors) > 0 {
+		err = fmt.Errorf("transform ts code error: %v", strings.Join(errors, "\n"))
+	}
+
+	return tsCode, imports, err
+}
+
+func getImportPath(file string, path string) (string, error) {
+	relpath := filepath.Dir(file)
+	file = filepath.Join(relpath, path)
+	if !strings.HasSuffix(path, ".ts") {
+		if exist, _ := application.App.Exists(file + ".ts"); exist {
+			file = file + ".ts"
+			return file, nil
+
+		} else if exist, _ := application.App.Exists(filepath.Join(path, "index.ts")); exist {
+			file = file + "index.ts"
+			return file, nil
+		}
+	}
+
+	if exist, _ := application.App.Exists(file); !exist {
+		return "", fmt.Errorf("file %s not exists", file)
+	}
+
+	return file, nil
 }
 
 // Transform the javascript
@@ -139,8 +418,6 @@ func SelectRoot(id string) (*Script, error) {
 
 // NewContext create a new context
 func (script *Script) NewContext(sid string, global map[string]interface{}) (*Context, error) {
-
-	fmt.Println("create a new context", sid, script.ID)
 
 	timeout := script.Timeout
 	if timeout == 0 {
@@ -301,6 +578,12 @@ func (script *Script) execStandard(process *process.Process) interface{} {
 
 	jsRes, err := global.MethodCall(process.Method, bridge.Valuers(jsArgs)...)
 	if err != nil {
+
+		// Debug output the error stack
+		if e, ok := err.(*v8go.JSError); ok {
+			color.Red("%s\n\n", e.StackTrace)
+		}
+
 		log.Error("scripts.%s.%s %s", script.ID, process.Method, err.Error())
 		exception.Err(err, 500).Throw()
 		return nil
