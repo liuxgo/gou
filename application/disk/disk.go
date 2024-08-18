@@ -47,6 +47,24 @@ func Open(root string) (*Disk, error) {
 	return &Disk{root: path, watched: sync.Map{}}, nil
 }
 
+// Glob the files by pattern
+func (disk *Disk) Glob(pattern string) ([]string, error) {
+	file, err := disk.abs(pattern)
+	if err != nil {
+		return nil, err
+	}
+	matches, err := filepath.Glob(file)
+	if err != nil {
+		return nil, err
+	}
+
+	for i, match := range matches {
+		matches[i] = strings.TrimPrefix(match, disk.root)
+	}
+
+	return matches, nil
+}
+
 // Walk traverse folders and read file contents
 func (disk *Disk) Walk(root string, handler func(root, file string, isdir bool) error, patterns ...string) error {
 	rootAbs, err := disk.abs(root)
@@ -94,6 +112,10 @@ func (disk *Disk) Walk(root string, handler func(root, file string, isdir bool) 
 		}
 
 		err = handler(root, name, isdir)
+		if filepath.SkipDir == err || filepath.SkipAll == err {
+			return err
+		}
+
 		if err != nil {
 			log.Error("[disk.Walk] %s %s", filename, err.Error())
 			return err

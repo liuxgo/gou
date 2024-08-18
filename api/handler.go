@@ -3,14 +3,15 @@ package api
 import (
 	"context"
 	"fmt"
+	jsoniter "github.com/json-iterator/go"
 	"io"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"unicode"
 
 	"github.com/gin-gonic/gin"
-	jsoniter "github.com/json-iterator/go"
 	"github.com/yaoapp/gou/helper"
 	"github.com/yaoapp/gou/process"
 	v8 "github.com/yaoapp/gou/runtime/v8"
@@ -411,14 +412,25 @@ func (path Path) setPayload(c *gin.Context) {
 
 		}
 
-		payloads := map[string]interface{}{}
-		err = jsoniter.Unmarshal(bytes, &payloads)
-		if err != nil {
-			c.Set("__payloads", map[string]interface{}{})
-			log.Error("[Path] %s %s", path.Path, err.Error())
+		if isFirstNonSpaceChar(string(bytes), '{') {
+			payloads := map[string]interface{}{}
+			err = jsoniter.Unmarshal(bytes, &payloads)
+			if err != nil {
+				c.Set("__payloads", map[string]interface{}{})
+				log.Error("[Path] %s %s", path.Path, err.Error())
+			}
+			c.Set("__payloads", payloads)
 		}
-		c.Set("__payloads", payloads)
-		c.Request.Body = io.NopCloser(strings.NewReader(string(bytes)))
 
+		c.Request.Body = io.NopCloser(strings.NewReader(string(bytes)))
 	}
+}
+
+func isFirstNonSpaceChar(text string, char rune) bool {
+	for _, r := range text {
+		if !unicode.IsSpace(r) {
+			return r == char
+		}
+	}
+	return false
 }

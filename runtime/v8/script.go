@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/evanw/esbuild/pkg/api"
@@ -25,14 +26,8 @@ var Scripts = map[string]*Script{}
 // Modules the scripts for modules
 var Modules = map[string]Module{}
 
-// ModuleSourceMap the module source maps
-var ModuleSourceMap = map[string]string{}
-
 // ImportMap the import maps
 var ImportMap = map[string][]Import{}
-
-// SourceMap the source maps
-var SourceMap = map[string]string{}
 
 // RootScripts the scripts for studio
 var RootScripts = map[string]*Script{}
@@ -41,7 +36,20 @@ var RootScripts = map[string]*Script{}
 var importRe = regexp.MustCompile(`import\s+\t*\n*(\*\s+as\s+\w+|\{[^}]+\}|\w+)\s+from\s+["']([^"']+)["'];?`)
 var exportRe = regexp.MustCompile(`export\s+(default|function|class|const|var|let)\s+`)
 
-var internalKeepModules = []string{"/yao.ts", "/yao", "/gou", "/gou.ts"}
+var internalKeepModuleSuffixes = []string{"/yao.ts", "/yao", "/gou", "/gou.ts"}
+var internalKeepModules = []string{"@yao", "@yaoapps", "@yaoapp", "@gou"}
+
+// the lock for the scripts
+var syncLock = sync.Mutex{}
+
+// GetModuleName get the module name
+func GetModuleName(file string) string {
+	replaces := []string{"@", "/", ".", "-", "[", "]", "(", ")", "{", "}", ":", ",", ";", " ", "\t", "\n", "\r"}
+	for _, replace := range replaces {
+		file = strings.ReplaceAll(file, replace, "_")
+	}
+	return file
+}
 
 // NewScript create a new script
 func NewScript(file string, id string, timeout ...time.Duration) *Script {
@@ -58,44 +66,59 @@ func NewScript(file string, id string, timeout ...time.Duration) *Script {
 	}
 }
 
+// Open open the script
+func (script *Script) Open(source []byte) error {
+	var err error = nil
+	if strings.HasSuffix(script.File, ".ts") {
+		source, err = TransformTS(script.File, source)
+		if err != nil {
+			return err
+		}
+	}
+	script.Source = string(source)
+	return nil
+}
+
+// MakeScript make a script from source
+func MakeScript(source []byte, file string, timeout time.Duration, isroot ...bool) (*Script, error) {
+	syncLock.Lock()
+	defer syncLock.Unlock()
+	script := NewScript(file, file, timeout)
+	err := script.Open(source)
+	if err != nil {
+		return nil, err
+	}
+	script.Root = false
+	if len(isroot) > 0 {
+		script.Root = isroot[0]
+	}
+	return script, nil
+}
+
 // Load load the script
 func Load(file string, id string) (*Script, error) {
-	script := NewScript(file, id)
 	source, err := application.App.Read(file)
 	if err != nil {
 		return nil, err
 	}
-
-	if strings.HasSuffix(file, ".ts") {
-		source, err = TransformTS(file, source)
-		if err != nil {
-			return nil, err
-		}
+	script, err := MakeScript(source, file, 5*time.Second, false)
+	if err != nil {
+		return nil, err
 	}
-
-	script.Source = string(source)
-	script.Root = false
 	Scripts[id] = script
 	return script, nil
 }
 
 // LoadRoot load the script with root privileges
 func LoadRoot(file string, id string) (*Script, error) {
-	script := NewScript(file, id)
 	source, err := application.App.Read(file)
 	if err != nil {
 		return nil, err
 	}
-
-	if strings.HasSuffix(file, ".ts") {
-		source, err = TransformTS(file, source)
-		if err != nil {
-			return nil, err
-		}
+	script, err := MakeScript(source, file, 5*time.Second, true)
+	if err != nil {
+		return nil, err
 	}
-
-	script.Source = string(source)
-	script.Root = true
 	RootScripts[id] = script
 	return script, nil
 }
@@ -103,23 +126,23 @@ func LoadRoot(file string, id string) (*Script, error) {
 // CLearModules clear the modules cache
 func CLearModules() {
 	Modules = map[string]Module{}
-	ModuleSourceMap = map[string]string{}
 	ImportMap = map[string][]Import{}
-	SourceMap = map[string]string{}
+	clearSourceMaps()
 }
 
 // TransformTS transform the typescript
 func TransformTS(file string, source []byte) ([]byte, error) {
 
-	tsCode, err := tsImports(file, source)
+	tsCode, err := tsImports(file, removeCommentsAndKeepLines(source))
 	if err != nil {
 		return nil, err
 	}
 
 	result := api.Transform(tsCode, api.TransformOptions{
-		Loader:    api.LoaderTS,
-		Target:    api.ESNext,
-		Sourcemap: api.SourceMapExternal,
+		Loader:     api.LoaderTS,
+		Target:     api.ESNext,
+		Sourcefile: file,
+		Sourcemap:  api.SourceMapExternal,
 	})
 
 	if len(result.Errors) > 0 {
@@ -130,8 +153,8 @@ func TransformTS(file string, source []byte) ([]byte, error) {
 		return nil, fmt.Errorf("transform ts code error: %v", strings.Join(errors, "\n"))
 	}
 
-	// Add the source map
-	SourceMap[file] = string(result.Map)
+	SourceMaps[file] = result.Map
+	SourceCodes[file] = result.Code
 
 	// Add the module source
 	jsCode := result.Code
@@ -143,13 +166,12 @@ func TransformTS(file string, source []byte) ([]byte, error) {
 			for _, imp := range imports {
 				module, has := Modules[imp.AbsPath]
 				if has {
-					importCodes = append(importCodes, fmt.Sprintf("%s;\nconst %s = %s;", module.Source, imp.Name, module.GlobalName))
+					importCodes = append(importCodes, fmt.Sprintf("%s;const %s = %s;", module.Source, imp.Name, module.GlobalName))
 				}
 			}
 		}
-
 		if len(importCodes) > 0 {
-			jsCode = []byte(strings.Join(importCodes, "\n") + "\n" + string(result.Code))
+			jsCode = []byte(strings.Join(importCodes, ";") + string(result.Code))
 		}
 	}
 
@@ -163,6 +185,30 @@ type entry struct {
 	absfile string
 	source  string
 	file    string
+}
+
+func removeCommentsAndKeepLines(code []byte) []byte {
+	lines := strings.Split(string(code), "\n")
+	for i, line := range lines {
+		// Start with /*
+		if strings.HasPrefix(strings.TrimSpace(line), "/*") {
+			lines[i] = ""
+			for {
+				if strings.Contains(line, "*/") {
+					break
+				}
+				i++
+				line = lines[i]
+				lines[i] = ""
+			}
+		}
+
+		// Start with //
+		if strings.HasPrefix(strings.TrimSpace(line), "//") {
+			lines[i] = ""
+		}
+	}
+	return []byte(strings.Join(lines, "\n"))
 }
 
 func getEntryPoints(file string, tsCode string, loaded map[string]bool) (string, []entry, error) {
@@ -209,7 +255,7 @@ func loadModule(file string, tsCode string) error {
 		return nil
 	}
 
-	globalName := strings.ReplaceAll(strings.ReplaceAll(file, "/", "_"), ".", "_")
+	globalName := GetModuleName(file)
 	entryPoints := []entry{}
 	loaded := map[string]bool{}
 	tsCode, entryPoints, err := getEntryPoints(file, tsCode, loaded)
@@ -224,7 +270,8 @@ func loadModule(file string, tsCode string) error {
 		codes[entry.absfile] = entry.source
 	}
 
-	dir := filepath.Dir(absFile)
+	paths := strings.Split(file, string(os.PathSeparator))
+	dir := filepath.Join(root, paths[0]) // <app_root>/scripts, <app_root>/services, etc..
 	outdir := filepath.Join(string(os.PathSeparator), "outdir")
 
 	result := api.Build(api.BuildOptions{
@@ -237,6 +284,7 @@ func loadModule(file string, tsCode string) error {
 			".ts": api.LoaderTS,
 		},
 		Sourcemap: api.SourceMapExternal,
+		Outbase:   dir,
 		Outdir:    outdir,
 		Plugins: []api.Plugin{
 			{
@@ -267,9 +315,10 @@ func loadModule(file string, tsCode string) error {
 	if len(result.OutputFiles) > 1 {
 		for _, out := range result.OutputFiles {
 			if strings.HasSuffix(out.Path, ".js.map") {
-				key := strings.TrimPrefix(strings.ReplaceAll(out.Path, ".js.map", ".ts.map"), outdir)
+				key := strings.TrimPrefix(strings.ReplaceAll(out.Path, ".js.map", ".ts"), outdir)
 				key = filepath.Join(dir, key)
-				ModuleSourceMap[key] = string(out.Contents)
+				ModuleSourceMaps[key] = out.Contents
+
 			} else if strings.HasSuffix(out.Path, ".js") {
 				key := strings.TrimPrefix(strings.ReplaceAll(out.Path, ".js", ".ts"), outdir)
 				key = filepath.Join(dir, key)
@@ -313,12 +362,21 @@ func replaceImportCode(file string, source []byte) (string, []Import, error) {
 			importClause, importPath := matches[1], matches[2]
 
 			// Filter the internal keep modules
-			for _, keep := range internalKeepModules {
+			for _, keep := range internalKeepModuleSuffixes {
 				if strings.HasSuffix(importPath, keep) {
 					lines := strings.Split(m, "\n")
 					for i, line := range lines {
 						lines[i] = "// " + line
 
+					}
+					return strings.Join(lines, "\n")
+				}
+			}
+			for _, keep := range internalKeepModules {
+				if strings.HasPrefix(importPath, keep) {
+					lines := strings.Split(m, "\n")
+					for i, line := range lines {
+						lines[i] = "// " + line
 					}
 					return strings.Join(lines, "\n")
 				}
@@ -361,8 +419,25 @@ func replaceImportCode(file string, source []byte) (string, []Import, error) {
 }
 
 func getImportPath(file string, path string) (string, error) {
-	relpath := filepath.Dir(file)
-	file = filepath.Join(relpath, path)
+
+	var tsfile string
+	var fromTsConfig bool = false
+	if runtimeOption.TSConfig != nil {
+		var err error
+		tsfile, fromTsConfig, err = runtimeOption.TSConfig.GetFileName(path)
+		if err != nil {
+			return "", err
+		}
+		if fromTsConfig {
+			file = tsfile
+		}
+	}
+
+	if !fromTsConfig {
+		relpath := filepath.Dir(file)
+		file = filepath.Join(relpath, path)
+	}
+
 	if !strings.HasSuffix(path, ".ts") {
 		if exist, _ := application.App.Exists(file + ".ts"); exist {
 			file = file + ".ts"
@@ -440,13 +515,14 @@ func (script *Script) NewContext(sid string, global map[string]interface{}) (*Co
 		}
 
 		return &Context{
-			ID:      script.ID,
-			Sid:     sid,
-			Data:    global,
-			Root:    script.Root,
-			Timeout: timeout,
-			Runner:  runner,
-			Context: ctx,
+			ID:          script.ID,
+			Sid:         sid,
+			Data:        global,
+			Root:        script.Root,
+			Timeout:     timeout,
+			Runner:      runner,
+			Context:     ctx,
+			SourceRoots: script.SourceRoots,
 		}, nil
 
 	}
@@ -484,6 +560,7 @@ func (script *Script) NewContext(sid string, global map[string]interface{}) (*Co
 		Isolate:       iso,
 		Context:       ctx,
 		UnboundScript: instance,
+		SourceRoots:   script.SourceRoots,
 	}, nil
 }
 
@@ -581,7 +658,7 @@ func (script *Script) execStandard(process *process.Process) interface{} {
 
 		// Debug output the error stack
 		if e, ok := err.(*v8go.JSError); ok {
-			color.Red("%s\n\n", e.StackTrace)
+			color.Red("%s\n\n", StackTrace(e, script.SourceRoots))
 		}
 
 		log.Error("scripts.%s.%s %s", script.ID, process.Method, err.Error())
